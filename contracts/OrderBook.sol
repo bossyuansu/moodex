@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0; 
 pragma abicoder v2;
-import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./MathHelper.sol";
 import "./IERC20Minimal.sol";
+import "./MathHelper.sol";
 import "./OrderedSet.sol";
 
 contract OrderBook{ 
@@ -16,14 +16,17 @@ contract OrderBook{
    event Transaction(address buyer, address seller, uint256 price, uint256 amount);
    uint16 public constant SIG_DIGITS=5;  //# of significant digits
    uint16 public constant MAX_DEPTH=100;
+   uint16 public constant PRICE_DECIMAL=18;
 
    uint public maxPrecision;
+   uint public leftoverBase;
+   uint public leftoverToken;
 
    OrderedUint256Set.Set private buyBook;
    OrderedUint256Set.Set private sellBook;
 
    mapping(uint256=>OrderedSet.Set) private theBook;
-   mapping(address=>mapping(uint256=>uint256)) public amounts;
+   mapping(address=>mapping(uint256=>uint256)) public theAmounts;
 
    // latest transaction price
    uint256 curPrice;
@@ -31,51 +34,111 @@ contract OrderBook{
    IERC20Minimal public Base;
    IERC20Minimal public Token;
 
-   using Counters for Counters.Counter;
+   uint baseDecimals;
+   uint tokenDecimals;
 
-   Counters.Counter private _tokenIds;
-
-   constructor(IERC20Minimal base, IERC20Minimal token) public {
+   constructor(IERC20Minimal base, uint bDecimals, IERC20Minimal token, uint tDecimals) public {
       Base = base;
       Token = token;
       maxPrecision = 0;
+      leftoverBase = 0;
+      leftoverToken = 0;
+
+      baseDecimals = bDecimals;
+      tokenDecimals = tDecimals;
    }
 
+   function enumerateBook(bool isBuy, uint depth) view public returns (uint[] memory, uint[] memory) {
+
+      require (depth <= MAX_DEPTH, "depth is too deep");
+
+      uint[] memory prices = new uint[](depth);
+      uint[] memory amounts = new uint[](depth);
+
+      OrderedUint256Set.Set storage book;
+      if (isBuy) {
+         book = buyBook;
+      } else {
+         book = sellBook;
+      }
+
+      uint256 tmpPrice = OrderedUint256Set.head(book);
+      for (uint i = 0; i < depth && tmpPrice != 0; ++i) {
+         prices[i] = tmpPrice;
+         address tmpOwner = OrderedSet.head(theBook[tmpPrice]);
+         uint amount = theAmounts[tmpOwner][tmpPrice];
+         while ((tmpOwner = theBook[tmpPrice].next[tmpOwner]) != address(0)) {
+            amount += theAmounts[tmpOwner][tmpPrice];
+         }
+         amounts[i] = amount; 
+         tmpPrice = book.next[tmpPrice];
+      }
+
+      return (prices, amounts);
+   }
+
+   // order is important
+   function batchOrder(uint256[] calldata prices, uint256[] calldata amounts, bool[] calldata isBuys) public {
+      for (uint i; i< prices.length; ++i) {
+         order(prices[i], amounts[i], isBuys[i]);
+      }
+   }
    function order(uint256 price, uint256 amount, bool isBuy) public {
+      price = normalizePrice(price);
       if (isBuy) {
          buy(price, amount);
       } else {
          sell(price, amount);
       }
+      updatePrecision(curPrice);
    }
+   function normalizePrice(uint256 price) public view returns (uint256) {
+      if (maxPrecision != 0) {
+         uint length = bytes(uint2str(price)).length;
+         require(length > maxPrecision, "the price is too granular");
+         price -= price % MathHelper.pow(10, maxPrecision);
+      }
+      return price;
+   }
+
+   function baseAmountByPrice(uint256 price, uint256 tokenAmount) public view returns (uint256 baseAmount) {
+      return MathHelper.mulDiv(tokenAmount, price, MathHelper.pow(10,tokenDecimals));
+   }
+
    function buy(uint256 price, uint256 amount) internal 
    {
-      Base.transferFrom(msg.sender, address(this), amount);
+      //calculate the amount of base tokens to be transfered
+      uint256 baseAmount = baseAmountByPrice(price, amount);
+      require (baseAmount > 0, "price x amount is too low");
+
+      Base.transferFrom(msg.sender, address(this), baseAmount);
       uint256 transferAmount = 0;
-      address user = msg.sender;
       // case 1, if the order is below the current market
       uint256 tmpPrice = OrderedUint256Set.head(sellBook);
       if (price < tmpPrice || tmpPrice == 0) {
          addOrderEntry(price, amount, true);
-      }
-
+         return;
+      } 
       address tmpOwner = OrderedSet.head(theBook[tmpPrice]);
       for (uint256 i=0; i < MAX_DEPTH && amount > 0 && price >= tmpPrice; ++i) 
       {
-         uint256 orderAmount = amounts[tmpOwner][tmpPrice];
+         uint256 orderAmount = theAmounts[tmpOwner][tmpPrice];
          uint256 txAmount;
          if (orderAmount >= amount) { //meaning the current order can fill
             txAmount = amount;
          } else {
             txAmount = orderAmount;
          }
-         amounts[tmpOwner][tmpPrice] -= txAmount;
+         theAmounts[tmpOwner][tmpPrice] -= txAmount;
          transferAmount += txAmount;
-         emit Transaction(tmpOwner, user, tmpPrice, txAmount);
+         emit Transaction(tmpOwner, msg.sender, tmpPrice, txAmount);
+         Base.transfer(tmpOwner, baseAmountByPrice(tmpPrice, txAmount));
+         baseAmount -= baseAmountByPrice(tmpPrice, txAmount);
+
          amount -= txAmount;
          curPrice = tmpPrice;
 
-         if (amounts[tmpOwner][tmpPrice] == 0) {
+         if (theAmounts[tmpOwner][tmpPrice] == 0) {
             OrderedSet.remove(theBook[tmpPrice], tmpOwner);
             tmpOwner = OrderedSet.head(theBook[tmpPrice]);
             if (tmpOwner == address(0)) {
@@ -91,40 +154,49 @@ contract OrderBook{
       }
 
       if (amount > 0 && (price < tmpPrice || tmpPrice == 0) ) {
-         addOrderEntry(price, amount, true);
+         if (addOrderEntry(price, amount, true) == true) {
+            baseAmount -= baseAmountByPrice(price, amount);
+         }
       }
 
-      Token.transferFrom(address(this), msg.sender, transferAmount);
+      // refund any left overs
+      if (baseAmount > 0) {
+         Base.transfer(msg.sender, baseAmount);
+      }
+
+      // transfer the tokens acquired.
+      Token.transfer(msg.sender, transferAmount);
    }
 
    function sell(uint256 price, uint256 amount) internal 
    {
       Token.transferFrom(msg.sender, address(this), amount);
-      address user = msg.sender;
       // case 1, if the order is below the current market
       uint256 tmpPrice = OrderedUint256Set.head(buyBook);
       uint256 transferAmount = 0;
       if (price > tmpPrice || tmpPrice == 0) {
-         addOrderEntry(price, amount, true);
+         addOrderEntry(price, amount, false);
+         return;
       }
 
       address tmpOwner = OrderedSet.head(theBook[tmpPrice]);
       for (uint256 i=0; i < MAX_DEPTH && amount > 0 && price <= tmpPrice; ++i) 
       {
-         uint256 orderAmount = amounts[tmpOwner][tmpPrice];
+         uint256 orderAmount = theAmounts[tmpOwner][tmpPrice];
          uint256 txAmount;
          if (orderAmount >= amount) { //meaning the current order can fill
             txAmount = amount;
          } else {
             txAmount = orderAmount;
          }
-         amounts[tmpOwner][tmpPrice] -= txAmount;
-         emit Transaction(user, tmpOwner, tmpPrice, txAmount);
+         theAmounts[tmpOwner][tmpPrice] -= txAmount;
+         emit Transaction(msg.sender, tmpOwner, tmpPrice, txAmount);
+         Token.transfer(tmpOwner, txAmount);
          amount -= txAmount;
-         transferAmount += txAmount * tmpPrice / 10^18;
+         transferAmount += baseAmountByPrice(tmpPrice, txAmount);
          curPrice = tmpPrice;
 
-         if (amounts[tmpOwner][tmpPrice] == 0) {
+         if (theAmounts[tmpOwner][tmpPrice] == 0) {
             OrderedSet.remove(theBook[tmpPrice], tmpOwner);
             tmpOwner = OrderedSet.head(theBook[tmpPrice]);
             if (tmpOwner == address(0)) {
@@ -140,13 +212,21 @@ contract OrderBook{
       }
 
       if (amount > 0 && (price > tmpPrice || tmpPrice == 0) ) {
-         addOrderEntry(price, amount, false);
+         if (addOrderEntry(price, amount, false) == true) {
+            amount = 0;
+         }
       }
-      Base.transferFrom(address(this), msg.sender, transferAmount);
+      //refund any remaining amount
+      if (amount >0) {
+         Token.transfer(msg.sender, amount);
+      }
+
+      // transfer the proceedings
+      Base.transfer(msg.sender, transferAmount);
    }
 
    function removeOrderEntry(uint256 price) public {
-      require(amounts[msg.sender][price] > 0, "invalid order amount");
+      require(theAmounts[msg.sender][price] > 0, "invalid order amount");
       OrderedSet.remove(theBook[price], msg.sender);
       if (OrderedSet.head(theBook[price]) == address(0)) {
          if (price <= OrderedUint256Set.head(buyBook)) {
@@ -158,18 +238,19 @@ contract OrderBook{
          delete theBook[price];
       }
    }
-   function addOrderEntry(uint256 price, uint256 amount, bool isBuy) public {
-      uint256 prevPrice = 0;
-      if (maxPrecision != 0) {
-         uint length = bytes(uint2str(price)).length;
-         require(length > maxPrecision, "the price is too granular");
-         price -= price % MathHelper.pow(10, maxPrecision);
+   function addOrderEntry(uint256 price, uint256 amount, bool isBuy) internal returns(bool) {
+
+      uint256 baseAmount = baseAmountByPrice(price, amount);
+      if (baseAmount == 0) {
+         return false; // do not add an entry if the amount x price is too low
       }
 
       require(price > 0, "price cannot be zero");
+
+      uint256 prevPrice = 0;
       if (isBuy) {
          uint256 tmpPrice = OrderedUint256Set.head(buyBook);
-         for (uint i = 0; price > tmpPrice && tmpPrice != 0; ++i) {
+         for (uint i = 0; price < tmpPrice && tmpPrice != 0; ++i) {
             require (i < MAX_DEPTH, "The order is too deep");
             prevPrice = tmpPrice;
             tmpPrice = buyBook.next[tmpPrice];
@@ -178,16 +259,18 @@ contract OrderBook{
             OrderedUint256Set._insert(buyBook, prevPrice, price, tmpPrice);
          }
 
-         OrderedSet.append(theBook[price], msg.sender);
-         amounts[msg.sender][price] += amount;
-
-         uint tmpLength = bytes(uint2str(OrderedUint256Set.head(buyBook))).length;
-         if (tmpLength > SIG_DIGITS) {
-            maxPrecision = tmpLength - SIG_DIGITS; 
+         // modifying an existing order will move the order to the back of the queue
+         if (OrderedSet.contains(theBook[price], msg.sender)) {
+            OrderedSet.remove(theBook[price], msg.sender);
          }
+         OrderedSet.append(theBook[price], msg.sender);
+         theAmounts[msg.sender][price] += amount;
+
+         updatePrecision(OrderedUint256Set.head(buyBook));
+
       } else {
          uint256 tmpPrice = OrderedUint256Set.head(sellBook);
-         for (uint i = 0; price < tmpPrice && tmpPrice != 0; ++i) {
+         for (uint i = 0; price > tmpPrice && tmpPrice != 0; ++i) {
             require (i < MAX_DEPTH, "The order is too deep");
             prevPrice = tmpPrice;
             tmpPrice = sellBook.next[tmpPrice];
@@ -196,12 +279,23 @@ contract OrderBook{
             OrderedUint256Set._insert(sellBook, prevPrice, price, tmpPrice);
          }
 
-         OrderedSet.append(theBook[price], msg.sender);
-         amounts[msg.sender][price] += amount;
-         uint tmpLength = bytes(uint2str(OrderedUint256Set.head(sellBook))).length;
-         if (tmpLength > SIG_DIGITS) {
-            maxPrecision = tmpLength - SIG_DIGITS; 
+         // modifying an existing order will move the order to the back of the queue
+         if (OrderedSet.contains(theBook[price], msg.sender)) {
+            OrderedSet.remove(theBook[price], msg.sender);
          }
+
+         OrderedSet.append(theBook[price], msg.sender);
+         theAmounts[msg.sender][price] += amount;
+
+         updatePrecision(OrderedUint256Set.head(sellBook));
+      }
+      return true;
+   }
+
+   function updatePrecision(uint256 price) internal {
+      uint tmpLength = bytes(uint2str(price)).length;
+      if (tmpLength > SIG_DIGITS) {
+         maxPrecision = tmpLength - SIG_DIGITS; 
       }
    }
 

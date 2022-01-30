@@ -46,6 +46,7 @@ jspm_packages/
 typings/
 cache/
 artifacts/
+deployments/
 
 # TypeScript cache
 *.tsbuildinfo

@@ -5,13 +5,13 @@ const func = async (hre) => {
   const { deploy } = deployments
   const { deployer } = await getNamedAccounts()
 
-  const result = await deploy('OrderBook', { // Replace `ERC20` with your contract's file name
+  const result = await deploy('GLDToken', { // Replace `ERC20` with your contract's file name
     from: deployer,
-    args: ["0xF02Efd44B57d143c38A329dD299683bf24Cf8aE0", "0xDeadDeAddeAddEAddeadDEaDDEAdDeaDDeAD0000"] ,
+    args: ["1000000000000000000000000000000000000"],
     log: true
   })
 
 }
 
-func.tags = ['OrderBook'] // Replace `ERC20` with your contract's file name
+func.tags = ['GLDToken'] // Replace `ERC20` with your contract's file name
 module.exports = func
